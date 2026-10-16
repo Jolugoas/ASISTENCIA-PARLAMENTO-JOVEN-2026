@@ -9,6 +9,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'cambiar-esta-clave')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///app.db').replace('postgres://','postgresql://',1)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 12 * 1024 * 1024
 db = SQLAlchemy(app)
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
 
@@ -127,40 +128,108 @@ def admin():
 
 @app.route('/admin/upload', methods=['POST'])
 def upload():
-    if not is_admin(): return redirect(url_for('admin_login'))
-    f=request.files.get('file')
-    if not f or not f.filename: flash('Selecciona un Excel o CSV.'); return redirect(url_for('admin'))
+    if not is_admin():
+        return redirect(url_for('admin_login'))
+    f = request.files.get('file')
+    if not f or not f.filename:
+        flash('Selecciona un archivo Excel o CSV.')
+        return redirect(url_for('admin'))
     try:
-        if f.filename.lower().endswith(('.xlsx','.xls')): df=pd.read_excel(f)
+        filename = f.filename.lower()
+        if filename.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(f, dtype=str, keep_default_na=False)
+        elif filename.endswith('.csv'):
+            raw = f.read()
+            text = raw.decode('utf-8-sig', errors='replace')
+            sep = ';' if text.count(';') > text.count(',') else ','
+            df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, keep_default_na=False)
         else:
-            raw=f.read(); txt=raw.decode('utf-8-sig', errors='replace'); sep=';' if txt.count(';')>txt.count(',') else ','; df=pd.read_csv(io.StringIO(txt), sep=sep)
-        df.columns=[normalize_col(c) for c in df.columns]
+            flash('Archivo no admitido. Usa .xlsx, .xls o .csv.')
+            return redirect(url_for('admin'))
+        df.columns = [normalize_col(c) for c in df.columns]
         if not {'REGION','NOMBRES_APELLIDOS'}.issubset(df.columns):
-            flash('El archivo debe incluir al menos REGION y NOMBRES_APELLIDOS.'); return redirect(url_for('admin'))
-        created=updated=skipped=0
-        for _,row in df.iterrows():
-            data={c:norm(row.get(c,'')) for c in df.columns}; region=data.get('REGION',''); name=data.get('NOMBRES_APELLIDOS','')
-            if not region or not name: skipped+=1; continue
-            dni=clean_dni(data.get('DNI')); correo=data.get('CORREO','').lower() or None; celular=re.sub(r'\D','',data.get('CELULAR','')) or None; idint=data.get('ID_INTERNO','') or None
-            p=None
-            if idint: p=Participant.query.filter_by(id_interno=idint).first()
-            if not p and dni: p=Participant.query.filter_by(dni=dni).first()
-            if not p and correo: p=Participant.query.filter(func.lower(Participant.correo)==correo).first()
-            if not p and celular: p=Participant.query.filter_by(celular=celular).first()
-            if not p:
-                nk=normkey(name)
-                p=next((c for c in Participant.query.filter_by(region=region).all() if normkey(c.nombres_apellidos)==nk), None)
-            fields={'id_interno':idint,'region':region,'dni':dni,'nombres_apellidos':name,'correo':correo,'celular':celular,
-                    'camara':data.get('CAMARA','') or None,'grupo_parlamentario':data.get('GRUPO_PARLAMENTARIO','') or None,
-                    'observacion':data.get('OBSERVACION','') or None}
+            flash('Faltan las columnas REGION o NOMBRES_APELLIDOS.')
+            return redirect(url_for('admin'))
+
+        # Solo UNA consulta general a PostgreSQL; la búsqueda por fila ocurre
+        # en memoria. Esto evita miles de consultas y timeouts en Railway.
+        existing = Participant.query.all()
+        by_id = {p.id_interno: p for p in existing if p.id_interno}
+        by_dni = {p.dni: p for p in existing if p.dni}
+        by_name = {(normkey(p.region), normkey(p.nombres_apellidos), normkey(p.camara)): p
+                   for p in existing}
+
+        created = updated = skipped = conflicts = 0
+        for r in df.to_dict(orient='records'):
+            data = {k: norm(v) for k, v in r.items()}
+            region = data.get('REGION', '').strip().upper()
+            name = data.get('NOMBRES_APELLIDOS', '').strip()
+            if not region or not name:
+                skipped += 1
+                continue
+            camara = data.get('CAMARA', '').strip().upper()
+            idint = data.get('ID_INTERNO', '').strip() or None
+            dni = clean_dni(data.get('DNI', ''))
+            correo = data.get('CORREO', '').strip().lower()
+            if correo in ('pendiente', 'sin correo', 'no tiene', '-'):
+                correo = ''
+            correo = correo or None
+            celular = re.sub(r'\D', '', data.get('CELULAR', '')) or None
+            # Match only on persistent identifier, DNI, or name + region + chamber;
+            # phone/email are not a reliable unique identity.
+            signature = (normkey(region), normkey(name), normkey(camara))
+            p_by_id = by_id.get(idint) if idint else None
+            p_by_dni = by_dni.get(dni) if dni else None
+            if p_by_id and p_by_dni and p_by_id is not p_by_dni:
+                conflicts += 1
+                continue
+            p = p_by_id or p_by_dni or by_name.get(signature)
+            if p and (normkey(p.region) != normkey(region)):
+                conflicts += 1
+                continue
+            if p and p.dni and dni and p.dni != dni:
+                conflicts += 1
+                continue
+            if p and idint and p.id_interno and idint != p.id_interno:
+                conflicts += 1
+                continue
+            if p and dni and by_dni.get(dni) not in (None,p):
+                conflicts += 1
+                continue
+
+            vals = {
+                'region': region, 'dni': dni, 'nombres_apellidos': name,
+                'correo': correo, 'celular': celular, 'camara': camara or None,
+                'grupo_parlamentario': data.get('GRUPO_PARLAMENTARIO', '') or None,
+                'observacion': data.get('OBSERVACION', '') or None
+            }
             if p:
-                for k,v in fields.items():
-                    if v not in (None,''): setattr(p,k,v)
-                updated+=1
-            else: db.session.add(Participant(**fields, activo=True)); created+=1
-        db.session.commit(); flash(f'Importación completada: {created} nuevos, {updated} actualizados, {skipped} omitidos. Las asistencias existentes NO fueron borradas.')
-    except Exception as e:
-        db.session.rollback(); flash('Error al importar: '+str(e))
+                for k, v in vals.items():
+                    # Blank cells never erase existing information.
+                    if v not in (None, ''):
+                        setattr(p, k, v)
+                if idint and not p.id_interno:
+                    p.id_interno = idint
+                updated += 1
+            else:
+                p = Participant(id_interno=idint, activo=True, **vals)
+                db.session.add(p)
+                created += 1
+            if p.id_interno:
+                by_id[p.id_interno] = p
+            if p.dni:
+                by_dni[p.dni] = p
+            by_name[(normkey(p.region), normkey(p.nombres_apellidos), normkey(p.camara))] = p
+
+        # Commit once; never touch the attendance tables.
+        db.session.commit()
+        flash(f'Base procesada: {created} nuevos, {updated} actualizados, '
+              f'{skipped} omitidos y {conflicts} conflictos. '
+              'Ninguna asistencia fue eliminada.')
+    except Exception:
+        app.logger.exception('Fallo en carga Excel/CSV')
+        db.session.rollback()
+        flash('No se pudo cargar el archivo. Revisa Deploy Logs en Railway para ver la causa exacta.')
     return redirect(url_for('admin'))
 
 @app.route('/admin/session/create', methods=['POST'])
